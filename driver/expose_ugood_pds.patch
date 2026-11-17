@@ -1,0 +1,125 @@
+--- a/drivers/scsi/megaraid/megaraid_sas_base.c
++++ b/drivers/scsi/megaraid/megaraid_sas_base.c
+@@ -91,6 +91,9 @@
+ 
+ static unsigned int scmd_timeout = MEGASAS_DEFAULT_CMD_TIMEOUT;
+ module_param(scmd_timeout, int, 0444);
++static bool expose_ugood_pds;
++module_param(expose_ugood_pds, bool, 0444);
++MODULE_PARM_DESC(expose_ugood_pds, "Expose Unconfigured Good PDs to the OS as pass-through disks (pseudo-JBOD, MFI series only). Default: 0");
+ MODULE_PARM_DESC(scmd_timeout, "scsi command timeout (10-90s), default 90s. See megasas_reset_timer.");
+ 
+ static int perf_mode = -1;
+@@ -4618,7 +4621,8 @@
+  * supported by the FW.
+  */
+ static int
+-megasas_get_pd_list(struct megasas_instance *instance)
++megasas_get_pd_list_pass(struct megasas_instance *instance, u8 qtype,
++			 u8 qarg, bool first)
+ {
+ 	int ret = 0, pd_index = 0;
+ 	struct megasas_cmd *cmd;
+@@ -4626,12 +4630,6 @@
+ 	struct MR_PD_LIST *ci;
+ 	struct MR_PD_ADDRESS *pd_addr;
+ 
+-	if (instance->pd_list_not_supported) {
+-		dev_info(&instance->pdev->dev, "MR_DCMD_PD_LIST_QUERY "
+-		"not supported by firmware\n");
+-		return ret;
+-	}
+-
+ 	ci = instance->pd_list_buf;
+ 
+ 	cmd = megasas_get_cmd(instance);
+@@ -4646,8 +4644,8 @@
+ 	memset(ci, 0, sizeof(*ci));
+ 	memset(dcmd->mbox.b, 0, MFI_MBOX_SIZE);
+ 
+-	dcmd->mbox.b[0] = MR_PD_QUERY_TYPE_EXPOSED_TO_HOST;
+-	dcmd->mbox.b[1] = 0;
++	dcmd->mbox.b[0] = qtype;
++	dcmd->mbox.b[1] = qarg;
+ 	dcmd->cmd = MFI_CMD_DCMD;
+ 	dcmd->cmd_status = MFI_STAT_INVALID_STATUS;
+ 	dcmd->sge_count = 1;
+@@ -4669,6 +4667,12 @@
+ 
+ 	switch (ret) {
+ 	case DCMD_FAILED:
++		if (!first) {
++			dev_warn(&instance->pdev->dev,
++				 "expose_ugood_pds: PD query type %u/%u failed\n",
++				 qtype, qarg);
++			break;
++		}
+ 		dev_info(&instance->pdev->dev, "MR_DCMD_PD_LIST_QUERY "
+ 			"failed/not supported by firmware\n");
+ 
+@@ -4713,10 +4717,20 @@
+ 			(MEGASAS_MAX_PD_CHANNELS * MEGASAS_MAX_DEV_PER_CHANNEL)))
+ 			break;
+ 
+-		memset(instance->local_pd_list, 0,
++		if (first)
++			memset(instance->local_pd_list, 0,
+ 				MEGASAS_MAX_PD * sizeof(struct megasas_pd_list));
+ 
+ 		for (pd_index = 0; pd_index < le32_to_cpu(ci->count); pd_index++) {
++			if (!first) {
++				if (pd_addr->scsiDevType != TYPE_DISK) {
++					pd_addr++;
++					continue;
++				}
++				dev_info(&instance->pdev->dev,
++					 "expose_ugood_pds: PD %u (UGood) exposed as pass-through disk\n",
++					 le16_to_cpu(pd_addr->deviceId));
++			}
+ 			instance->local_pd_list[le16_to_cpu(pd_addr->deviceId)].tid	=
+ 					le16_to_cpu(pd_addr->deviceId);
+ 			instance->local_pd_list[le16_to_cpu(pd_addr->deviceId)].driveType	=
+@@ -4743,6 +4757,26 @@
+ 	return ret;
+ }
+ 
++static int
++megasas_get_pd_list(struct megasas_instance *instance)
++{
++	int ret;
++
++	if (instance->pd_list_not_supported) {
++		dev_info(&instance->pdev->dev, "MR_DCMD_PD_LIST_QUERY "
++		"not supported by firmware\n");
++		return 0;
++	}
++
++	ret = megasas_get_pd_list_pass(instance, MR_PD_QUERY_TYPE_EXPOSED_TO_HOST,
++				       0, true);
++	if (ret == DCMD_SUCCESS && expose_ugood_pds &&
++	    instance->adapter_type == MFI_SERIES)
++		megasas_get_pd_list_pass(instance, MR_PD_QUERY_TYPE_STATE,
++					 MR_PD_STATE_UNCONFIGURED_GOOD, false);
++	return ret;
++}
++
+ /*
+  * megasas_get_ld_list_info -	Returns FW's ld_list structure
+  * @instance:				Adapter soft state
+@@ -8949,6 +8983,16 @@
+ 			event_type = 0;
+ 			break;
+ 		}
++		if (expose_ugood_pds && instance->adapter_type == MFI_SERIES) {
++			switch (le32_to_cpu(instance->evt_detail->code)) {
++			case MR_EVT_LD_CREATED:
++			case MR_EVT_LD_DELETED:
++			case MR_EVT_LD_OFFLINE:
++			case 0x0072: /* MR_EVT_PD_STATE_CHANGE */
++				event_type |= SCAN_PD_CHANNEL;
++				break;
++			}
++		}
+ 	} else {
+ 		dev_err(&instance->pdev->dev, "invalid evt_detail!\n");
+ 		mutex_unlock(&instance->reset_mutex);
